@@ -115,5 +115,92 @@ if [ $? -ne 0 ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Build failed!"
     exit 1
 fi
+#!/bin/bash
+# Log file for debugging
+source shell/custom-packages.sh
+source shell/switch_repository.sh
+echo "第三方软件包: $CUSTOM_PACKAGES"
+LOGFILE="/tmp/uci-defaults-log.txt"
+echo "Starting 99-custom.sh at $(date)" >> $LOGFILE
+echo "编译固件大小为: $PROFILE MB"
+echo "Include Docker: $INCLUDE_DOCKER"
 
+# ========== 根据环境变量判断是否加载BBR ==========
+if [ "$ENABLE_BBR" = "true" ]; then
+  echo "✅ ENABLE_BBR=true，启用BBR相关配置"
+  mkdir -p /home/build/immortalwrt/files/etc/sysctl.d
+  cat << EOF > /home/build/immortalwrt/files/etc/sysctl.d/99-bbr.conf
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+EOF
+  git clone --depth=1 https://github.com/chenmozhijin/luci-app-tcpbbr.git /home/build/immortalwrt/extra-packages/luci-app-tcpbbr
+  BBR_PACKAGES="kmod-tcp-bbr luci-app-tcpbbr"
+else
+  echo "❌ ENABLE_BBR=false，跳过BBR"
+  BBR_PACKAGES=""
+fi
+
+# ========== 根据环境变量判断是否加载Qosify ==========
+if [ "$ENABLE_QOSIFY" = "true" ]; then
+  echo "✅ ENABLE_QOSIFY=true，启用Qosify相关配置"
+  git clone --depth=1 https://github.com/immortalwrt-collections/openwrt-qosify.git /home/build/immortalwrt/extra-packages/qosify
+  QOSIFY_PACKAGES="qosify luci-app-qosify kmod-ifb kmod-sched-bpf kmod-sched-cake ip-full tc-tiny"
+else
+  echo "❌ ENABLE_QOSIFY=false，跳过Qosify"
+  QOSIFY_PACKAGES=""
+fi
+
+# ========== 合并全部新增软件包 ==========
+EXTRA_PACKAGES="$BBR_PACKAGES $QOSIFY_PACKAGES"
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES $EXTRA_PACKAGES"
+echo "📦 追加软件包列表：$EXTRA_PACKAGES"
+
+# ========== 生成uci-defaults开机自动脚本 ==========
+mkdir -p /home/build/immortalwrt/files/etc/uci-defaults
+cat << EOF > /home/build/immortalwrt/files/etc/uci-defaults/99-custom.sh
+#!/bin/sh
+# ImmortalWrt 首次开机自动配置 BBR + Qosify
+
+# ===================== BBR 拥塞控制自动设置 =====================
+cat > /etc/sysctl.d/99-bbr.conf <<EOF
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+EOF
+sysctl -p /etc/sysctl.d/99-bbr.conf
+
+# ===================== Qosify 自动初始化 =====================
+WAN_IF=\$(uci get network.wan.ifname)
+uci set qosify.@qosify[0].wan="\$WAN_IF"
+uci set qosify.@qosify[0].enabled='1'
+uci commit qosify
+/etc/init.d/qosify enable
+/etc/init.d/qosify start
+
+echo "===== BBR已启用，Qosify已自动绑定WAN口[\$WAN_IF] =====" >> /tmp/99-custom.log
+exit 0
+EOF
+chmod +x /home/build/immortalwrt/files/etc/uci-defaults/99-custom.sh
+
+echo "Create pppoe-settings"
+mkdir -p /home/build/immortalwrt/files/etc/config
+# 创建pppoe配置文件 yml传入环境变量ENABLE_PPPOE等 写入配置文件 供99-custom.sh读取
+cat << EOF > /home/build/immortalwrt/files/etc/config/pppoe-settings
+enable_pppoe=${ENABLE_PPPOE}
+pppoe_account=${PPPOE_ACCOUNT}
+pppoe_password=${PPPOE_PASSWORD}
+EOF
+
+echo "cat pppoe-settings"
+cat /home/build/immortalwrt/files/etc/config/pppoe-settings
+
+if [ -z "$CUSTOM_PACKAGES" ];then
+  echo "⭕ 未选择 任何第三方软件包"
+else
+  # ============ 同步第三方软件仓库===========
+  # 同步第三方软件仓库run/ipk
+  echo "🔍 正在同步第三方软件仓库 Cloning run file repo..."
+  git clone --depth=1 https://github.com/wukongdaily/store.git /tmp/store-run-repo
+  # 拷贝 run/x86 下所有 run 文件和ipk文件到 extra-packages 目录
+  mkdir -p /home/build/immortalwrt/extra-packages
+  # ...原有代码保持不变
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Build completed successfully."
